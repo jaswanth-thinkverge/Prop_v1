@@ -1,0 +1,137 @@
+name: Daily Auction Scrape
+
+on:
+  schedule:
+    - cron: '15 4 * * *'  # Runs daily at 10:00 AM IST (00:15 UTC)
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  run-scrapers:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        scraper:
+          - albion_combined_t2.py
+          - ibbi_gov.py
+      fail-fast: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Clean working directory
+        run: |
+          git clean -fdx
+          git reset --hard
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y chromium-browser chromium-chromedriver libmupdf-dev
+          if [ -f /usr/bin/chromedriver ]; then
+            sudo rm /usr/bin/chromedriver
+          fi
+          sudo ln -s /usr/lib/chromium-browser/chromedriver /usr/bin/chromedriver
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-scraping.txt
+
+      - name: Run scraper ${{ matrix.scraper }}
+        run: |
+          python ${{ matrix.scraper }}
+          mkdir -p auction_exports
+          mv master_results/*.csv auction_exports/ 2>/dev/null || true
+          mv *.csv auction_exports/ 2>/dev/null || true
+
+      - name: Debug directory contents
+        run: |
+          echo "Contents of auction_exports/:"
+          ls -la auction_exports/ || echo "Directory not found"
+          find auction_exports/ -type f || echo "No files found"
+
+      - name: Upload auction exports artifact
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: auction-exports-${{ matrix.scraper }}
+          path: auction_exports/
+          retention-days: 1
+          if-no-files-found: warn
+
+  combine-and-commit:
+    needs: run-scrapers
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Clean working directory
+        run: |
+          git clean -fdx
+          git reset --hard
+
+      - name: Download auction exports artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: auction_exports/
+          pattern: auction-exports-*
+          merge-multiple: true
+
+      - name: Move files to auction_exports/
+        run: |
+          for dir in auction_exports/auction-exports-*; do
+            if [ -d "$dir" ]; then
+              mv "$dir"/* auction_exports/ 2>/dev/null || true
+              rm -rf "$dir"
+            fi
+          done
+          echo "Contents of auction_exports/:"
+          ls -la auction_exports/ || echo "Directory not found"
+          find auction_exports/ -type f || echo "No files found"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-scraping.txt
+
+      - name: Process and combine auction data
+        run: python process_and_combine.py
+
+      - name: Debug directory contents
+        run: |
+          echo "Contents of auction_exports/:"
+          ls -la auction_exports/ || echo "Directory not found"
+          find auction_exports/ -type f || echo "No files found"
+
+      - name: Commit and push files
+        run: |
+          git config --global user.name 'GitHub Action'
+          git config --global user.email 'action@github.com'
+          git add auction_exports/
+          git commit -m "Update auction files for $(date +%Y-%m-%d)" || echo "No changes to commit"
+          git fetch origin
+          git pull --rebase origin main
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
